@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.DS_Store
+raycast-dev-
+.env
+CLAUDE.md
+.vscode/settings.json
+.mcp.json
+.vscode/settings.json
+.gitignore
+
+# YoYo AI version control directory
+.yoyo/
