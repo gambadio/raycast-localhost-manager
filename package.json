@@ -18,7 +18,6 @@
   },
   "dependencies": {
     "@raycast/api": "^1.102.6",
-    "codex": "^0.2.3",
     "execa": "^8.0.1",
     "pidusage": "^3.0.2"
   },
@@ -32,9 +31,10 @@
   },
   "schemaVersion": 1,
   "title": "Localhost Manager",
-  "icon": "assets/extension-icon.png",
+  "icon": "extension-icon.png",
   "categories": [
-    "Other"
+    "Developer Tools",
+    "System"
   ],
   "commands": [
     {
@@ -52,7 +52,7 @@
         "server",
         "kill"
       ],
-      "icon": "assets/extension-icon.png",
+      "icon": "extension-icon.png",
       "preferences": [
         {
           "name": "defaultViewMode",

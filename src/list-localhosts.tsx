@@ -1,10 +1,16 @@
-/// <reference path="../raycast-env.d.ts" />
-/// <reference path="./types.d.ts" />
-
 import { Action, ActionPanel, Icon, List, showToast, Toast, Detail, getPreferenceValues } from "@raycast/api";
 import { execa } from "execa";
 import pidusage from "pidusage";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+// =====================
+// Error helper
+// =====================
+function getErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "object" && err !== null && "stderr" in err) return String((err as { stderr: unknown }).stderr);
+  return String(err);
+}
 
 // =====================
 // System binary paths for macOS
@@ -345,3 +351,461 @@ export default function Command() {
             address: ap.address,
             port: ap.port,
             protocol: r.proto,
+            displayName: basename(r.cmd) || r.cmd,
+          });
+        }
+      }
+
+      const pids = [...new Set(base.map((b) => b.pid))];
+      const [statsByPid, extraInfoList] = await Promise.all([
+        enrichWithStats(pids),
+        Promise.all(
+          pids.map(async (pid) => {
+            const [cwd, psinfo] = await Promise.all([getCwd(pid), getPsInfo(pid)]);
+            return { pid, cwd, ...psinfo };
+          })
+        ),
+      ]);
+      const extraInfoByPid = Object.fromEntries(extraInfoList.map((e) => [e.pid, e]));
+
+      const merged = base.map((b) => {
+        const s = statsByPid[b.pid] || {};
+        const e = extraInfoByPid[b.pid] || {};
+        // Use the full command name from ps, fallback to lsof's abbreviated name
+        let displayName = e.fullCommand || basename(e.execPath) || b.cmd;
+
+        // If we still have a short abbreviated name, try to make it more readable
+        if (displayName && displayName.length <= 15 && !displayName.includes("/")) {
+          // Common macOS process name mappings
+          const nameMap: Record<string, string> = {
+            Spotify: "Spotify",
+            Sp: "Spotify",
+            Co: "Code",
+            Vi: "Visual Studio Code",
+            Go: "Google Chrome",
+            Ra: "Raycast",
+            On: "OneDrive",
+            sha: "sharingd",
+            Mi: "Microsoft Teams",
+            Library: "Library Agent",
+          };
+          displayName = nameMap[displayName] || displayName;
+        }
+
+        return {
+          ...b,
+          cpu: s.cpu,
+          memory: s.memory,
+          execPath: e.execPath,
+          cmdline: e.cmdline,
+          cwd: e.cwd,
+          startedAt: e.startedAt,
+          displayName,
+        };
+      });
+
+      merged.sort((a, b) => a.port - b.port);
+      setListeners(merged);
+
+      // Docker section
+      const has = await hasDocker();
+      setDockerAvailable(has);
+      if (has) {
+        const [list, statMap] = await Promise.all([getDockerContainers(), getDockerStatsByName()]);
+        const withStats = list.map((c) => ({ ...c, cpu: statMap[c.name]?.cpu, mem: statMap[c.name]?.mem }));
+        setContainers(withStats);
+      } else {
+        setContainers([]);
+      }
+    } catch (err: unknown) {
+      await showToast({
+        style: Toast.Style.Failure,
+        title: "Refresh failed",
+        message: getErrorMessage(err),
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    timerRef.current = setInterval(refresh, 4000);
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, [refresh]);
+
+  const hostItems = useMemo(() => {
+    // De-duplicate PID+address+port+protocol
+    const map = new Map<string, Listener>();
+    function isSystem(l: Listener) {
+      if (l.uid !== undefined && l.uid < 500) return true; // system UIDs
+      if (l.user && CURRENT_USER && l.user !== CURRENT_USER) return true; // other users
+      const p = l.execPath || l.cmd;
+      return (
+        p.startsWith("/System/") ||
+        p.startsWith("/usr/sbin/") ||
+        p.startsWith("/usr/libexec/") ||
+        p.startsWith("/Library/CoreServices/")
+      );
+    }
+    const hideSystem = optionsMode === "hideSystem" || optionsMode === "hideBoth";
+    for (const l of listeners) {
+      if (hideSystem && isSystem(l)) continue;
+      map.set(`${l.pid}-${l.address}-${l.port}-${l.protocol}`, l);
+    }
+    return [...map.values()];
+  }, [listeners, optionsMode]);
+
+  const ViewModeDropdown = (
+    <List.Dropdown
+      tooltip="View Mode"
+      storeValue={true}
+      value={viewMode}
+      onChange={(val) => setViewMode(val as "simple" | "advanced")}
+    >
+      <List.Dropdown.Item title="Simple View" value="simple" />
+      <List.Dropdown.Item title="Advanced View" value="advanced" />
+    </List.Dropdown>
+  );
+
+  const FilterDropdown = (
+    <List.Dropdown
+      tooltip="Filter Options"
+      storeValue={true}
+      value={optionsMode}
+      onChange={(val) => setOptionsMode(val as OptionsMode)}
+    >
+      <List.Dropdown.Item title="Show everything" value="all" />
+      <List.Dropdown.Item title="Hide system processes" value="hideSystem" />
+      <List.Dropdown.Item title="Hide 0% CPU badges" value="hideZeroCPU" />
+      <List.Dropdown.Item title="Hide system + 0% CPU" value="hideBoth" />
+    </List.Dropdown>
+  );
+
+  const searchBarAccessory = (
+    <Fragment>
+      {ViewModeDropdown}
+      {FilterDropdown}
+    </Fragment>
+  );
+
+  const isAdvanced = viewMode === "advanced";
+
+  return (
+    <List
+      isLoading={isLoading}
+      isShowingDetail={isAdvanced}
+      searchBarPlaceholder="Filter by port, command, user…"
+      searchBarAccessory={searchBarAccessory}
+    >
+      <List.Section title="Listening Ports (Host)">
+        {hostItems.map((l) => (
+          <List.Item
+            key={`host-${l.pid}-${l.address}-${l.port}-${l.protocol}`}
+            title={`:${l.port}`}
+            subtitle={isAdvanced ? l.displayName || l.cmd : `${l.protocol.toUpperCase()} • ${l.displayName || l.cmd}`}
+            accessories={(() => {
+              const hideZero = optionsMode === "hideZeroCPU" || optionsMode === "hideBoth";
+              const cpuText =
+                l.cpu !== undefined && (!hideZero || (l.cpu ?? 0) > 0.05) ? `${l.cpu?.toFixed(1)}% CPU` : undefined;
+              // In advanced view, show minimal info since we have the detail panel
+              const base = isAdvanced
+                ? [] // No accessories in advanced view - all info is in the detail panel
+                : [
+                    { text: `PID ${l.pid}`, tooltip: "Process ID" },
+                    l.user ? { text: l.user, tooltip: "User" } : undefined,
+                    cpuText ? { text: cpuText, tooltip: "CPU Usage" } : undefined,
+                  ];
+              return base.filter(Boolean) as { text: string }[];
+            })()}
+            icon={Icon.Terminal}
+            actions={<HostActions listener={l} onRefresh={refresh} />}
+            detail={
+              isAdvanced ? (
+                <List.Item.Detail
+                  markdown={`Port ${l.port} on ${friendlyAddress(l.address)}\n\n${l.displayName || l.cmd}`}
+                  metadata={
+                    <List.Item.Detail.Metadata>
+                      <List.Item.Detail.Metadata.Label title="App / Command" text={l.displayName || l.cmd} />
+                      <List.Item.Detail.Metadata.Label title="Protocol" text={l.protocol.toUpperCase()} />
+                      <List.Item.Detail.Metadata.Label title="PID" text={String(l.pid)} />
+                      {l.user ? <List.Item.Detail.Metadata.Label title="User" text={l.user} /> : null}
+                      {l.uid !== undefined ? (
+                        <List.Item.Detail.Metadata.Label title="UID" text={String(l.uid)} />
+                      ) : null}
+                      {l.execPath ? <List.Item.Detail.Metadata.Label title="Executable" text={l.execPath} /> : null}
+                      {l.cwd ? <List.Item.Detail.Metadata.Label title="Working Dir" text={l.cwd} /> : null}
+                      {l.startedAt ? <List.Item.Detail.Metadata.Label title="Started" text={l.startedAt} /> : null}
+                      {l.cpu !== undefined ? (
+                        <List.Item.Detail.Metadata.Label title="CPU" text={`${l.cpu?.toFixed(1)}%`} />
+                      ) : null}
+                      {l.memory !== undefined ? (
+                        <List.Item.Detail.Metadata.Label title="Memory" text={formatMem(l.memory)} />
+                      ) : null}
+                    </List.Item.Detail.Metadata>
+                  }
+                />
+              ) : undefined
+            }
+          />
+        ))}
+      </List.Section>
+
+      <List.Section title="Docker Containers">
+        {dockerAvailable === false && (
+          <List.Item
+            title="Docker not available"
+            subtitle="Install Docker Desktop and ensure the daemon is running"
+            icon={Icon.Warning}
+          />
+        )}
+        {dockerAvailable && containers.length === 0 && <List.Item title="No running containers" icon={Icon.Info} />}
+        {containers.map((c) => (
+          <List.Item
+            key={`ctr-${c.id}`}
+            title={c.name}
+            subtitle={isAdvanced ? c.image : c.status}
+            icon={Icon.Box}
+            accessories={
+              (isAdvanced
+                ? [] // No accessories in advanced view - all info is in the detail panel
+                : [
+                    c.ports.length
+                      ? {
+                          text:
+                            c.ports
+                              .map((p) => (p.hostPort ? `${p.hostPort}` : ``))
+                              .filter(Boolean)
+                              .join(", ") || undefined,
+                        }
+                      : undefined,
+                  ]
+              ).filter(Boolean) as { text: string }[]
+            }
+            actions={<DockerActions container={c} onRefresh={refresh} />}
+            detail={
+              isAdvanced ? (
+                <List.Item.Detail
+                  markdown={`Container ${c.name} (${c.image})\n\n${c.status}`}
+                  metadata={
+                    <List.Item.Detail.Metadata>
+                      <List.Item.Detail.Metadata.Label title="Image" text={c.image} />
+                      <List.Item.Detail.Metadata.Label title="Status" text={c.status} />
+                      {c.cpu !== undefined ? (
+                        <List.Item.Detail.Metadata.Label title="CPU" text={`${c.cpu?.toFixed(1)}%`} />
+                      ) : null}
+                      {c.mem ? <List.Item.Detail.Metadata.Label title="Memory" text={c.mem} /> : null}
+                      {c.ports.length ? (
+                        <List.Item.Detail.Metadata.TagList title="Ports">
+                          {c.ports.map((p, idx) => (
+                            <List.Item.Detail.Metadata.TagList.Item
+                              key={idx}
+                              text={
+                                p.hostPort
+                                  ? `${p.hostPort} → ${p.containerPort}/${p.protocol}`
+                                  : `${p.containerPort}/${p.protocol}`
+                              }
+                            />
+                          ))}
+                        </List.Item.Detail.Metadata.TagList>
+                      ) : null}
+                    </List.Item.Detail.Metadata>
+                  }
+                />
+              ) : undefined
+            }
+          />
+        ))}
+      </List.Section>
+    </List>
+  );
+}
+
+function HostActions({ listener, onRefresh }: { listener: Listener; onRefresh: () => void }) {
+  const url = `http://localhost:${listener.port}`;
+  async function kill(sig: "TERM" | "KILL") {
+    try {
+      await execa(KILL_PATH, ["-" + sig, String(listener.pid)]);
+      await showToast({ style: Toast.Style.Success, title: `Sent SIG${sig} to PID ${listener.pid}` });
+      onRefresh();
+    } catch (err: unknown) {
+      await showToast({
+        style: Toast.Style.Failure,
+        title: `Failed to kill PID ${listener.pid}`,
+        message: getErrorMessage(err),
+      });
+    }
+  }
+  async function killByPort(sig: "TERM" | "KILL") {
+    try {
+      const count = await killOwnersByPort(listener.port, listener.protocol, sig);
+      await showToast({
+        style: Toast.Style.Success,
+        title: `Sent SIG${sig} to ${count} owner(s) of :${listener.port}`,
+      });
+      onRefresh();
+    } catch (err: unknown) {
+      await showToast({
+        style: Toast.Style.Failure,
+        title: "Kill-by-Port Failed",
+        message: getErrorMessage(err),
+      });
+    }
+  }
+  return (
+    <ActionPanel>
+      <Action.OpenInBrowser url={url} title={`Open ${url}`} />
+      <Action.CopyToClipboard title="Copy Address" content={`${listener.address}:${listener.port}`} />
+      <Action.CopyToClipboard title="Copy PID" content={String(listener.pid)} />
+      <Action.CopyToClipboard title="Copy Command" content={listener.cmdline || listener.execPath || listener.cmd} />
+      {listener.execPath ? <Action.ShowInFinder path={listener.execPath} title="Reveal App in Finder" /> : null}
+      {listener.cwd ? <Action.Open title="Open Working Folder" target={listener.cwd} /> : null}
+      <ActionPanel.Section title="Stop App (by PID)">
+        <Action
+          title="Stop Nicely — Recommended"
+          icon={Icon.XMarkCircle}
+          onAction={() => kill("TERM")}
+          shortcut={{ modifiers: ["cmd"], key: "backspace" }}
+        />
+        <Action
+          title="Force Stop — If Stuck"
+          style={Action.Style.Destructive}
+          icon={Icon.Trash}
+          onAction={() => kill("KILL")}
+          shortcut={{ modifiers: ["cmd", "shift"], key: "backspace" }}
+        />
+      </ActionPanel.Section>
+      <ActionPanel.Section title={`Stop Whoever Uses :${listener.port}`}>
+        <Action title="Stop by Port (Nice)" icon={Icon.XMarkCircle} onAction={() => killByPort("TERM")} />
+        <Action
+          title="Stop by Port (Force)"
+          style={Action.Style.Destructive}
+          icon={Icon.Trash}
+          onAction={() => killByPort("KILL")}
+        />
+      </ActionPanel.Section>
+      <ActionPanel.Section>
+        <Action.Push title="Help & Glossary" icon={Icon.QuestionMark} target={<Help />} />
+        <Action title="Refresh" icon={Icon.RotateClockwise} onAction={onRefresh} />
+      </ActionPanel.Section>
+    </ActionPanel>
+  );
+}
+
+function DockerActions({ container, onRefresh }: { container: DockerContainer; onRefresh: () => void }) {
+  async function stop() {
+    const dockerPath = await findDockerPath();
+    if (!dockerPath) return;
+
+    try {
+      await execa(dockerPath, ["stop", container.id]);
+      await showToast({ style: Toast.Style.Success, title: `Stopped ${container.name}` });
+      onRefresh();
+    } catch (err: unknown) {
+      await showToast({
+        style: Toast.Style.Failure,
+        title: `Failed to stop ${container.name}`,
+        message: getErrorMessage(err),
+      });
+    }
+  }
+  async function start() {
+    const dockerPath = await findDockerPath();
+    if (!dockerPath) return;
+
+    try {
+      await execa(dockerPath, ["start", container.id]);
+      await showToast({ style: Toast.Style.Success, title: `Started ${container.name}` });
+      onRefresh();
+    } catch (err: unknown) {
+      await showToast({
+        style: Toast.Style.Failure,
+        title: `Failed to start ${container.name}`,
+        message: getErrorMessage(err),
+      });
+    }
+  }
+  async function restart() {
+    const dockerPath = await findDockerPath();
+    if (!dockerPath) return;
+
+    try {
+      await execa(dockerPath, ["restart", container.id]);
+      await showToast({ style: Toast.Style.Success, title: `Restarted ${container.name}` });
+      onRefresh();
+    } catch (err: unknown) {
+      await showToast({
+        style: Toast.Style.Failure,
+        title: `Failed to restart ${container.name}`,
+        message: getErrorMessage(err),
+      });
+    }
+  }
+
+  const openable = container.ports.filter((p) => p.hostPort);
+
+  return (
+    <ActionPanel>
+      {openable.length > 0 ? (
+        <ActionPanel.Section title="Open Published Ports">
+          {openable.map((p) => (
+            <Action.OpenInBrowser
+              key={`open-${container.id}-${p.hostPort}`}
+              url={`http://localhost:${p.hostPort}`}
+              title={`Open http://localhost:${p.hostPort}`}
+            />
+          ))}
+        </ActionPanel.Section>
+      ) : null}
+      <Action.CopyToClipboard title="Copy Container Name" content={container.name} />
+      <Action.CopyToClipboard title="Copy Container ID" content={container.id} />
+      <Action.CopyToClipboard title="Copy Image" content={container.image} />
+      <ActionPanel.Section title="Lifecycle">
+        <Action title="Stop" icon={Icon.Stop} onAction={stop} />
+        <Action title="Start" icon={Icon.Play} onAction={start} />
+        <Action title="Restart" icon={Icon.RotateClockwise} onAction={restart} />
+      </ActionPanel.Section>
+      <ActionPanel.Section>
+        <Action title="Refresh" icon={Icon.RotateClockwise} onAction={onRefresh} />
+      </ActionPanel.Section>
+    </ActionPanel>
+  );
+}
+
+function Help() {
+  const md = `# Localhost Manager — Help
+
+What you are seeing
+- A list of apps on your Mac that are “listening” for connections. Each one owns a port (like 3000) and a process (PID).
+
+Key terms (in plain English)
+- Port: A door number that apps use (e.g., 3000). The same app can use multiple ports.
+- Protocol: TCP or UDP. Most web/dev servers use TCP.
+- PID: The unique number of the running app. The fastest way to stop exactly that app.
+- User: Which macOS user started the app.
+- UID: The numeric form of the user. You can ignore this unless you know you need it.
+
+Stopping things — which action should I use?
+- Stop nicely — recommended: Sends SIGTERM. It politely asks the app to shut down and clean up. Try this first.
+- Force stop — if stuck: Sends SIGKILL. Instantly stops the app without cleanup. Use only if “Stop nicely” didn’t work.
+- Stop by port: When you only care about freeing a port (say :3000) and don’t know the exact process, this targets whoever is using that port. There is a nice and a force variant, same rules as above.
+
+Open in browser
+- Quickly opens http://localhost:<port>. Works for HTTP services.
+
+Simple vs Advanced view
+- Simple: Minimal info, fewer distractions.
+- Advanced: Full details (address, UID, paths, CPU/memory) with a right‑hand panel.
+
+Options
+- Hide system processes: hides background macOS daemons and other-user processes.
+- Hide 0% CPU badges: removes the “0.0% CPU” accessory to reduce noise.
+
+Tips
+- 127.0.0.1 and ::1 are the same as “localhost”.
+- 0.0.0.0 or * means “all network interfaces” (the app is reachable from other devices on your network, if your firewall allows it).
+`;
+  return <Detail markdown={md} />;
+}
